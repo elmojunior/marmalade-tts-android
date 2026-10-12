@@ -4,6 +4,8 @@
     <string name="service_synth_channel_name">Marmalade TTS Playback</string>
     <string name="service_synth_channel_description">Shows while Marmalade TTS is reading aloud</string>
     <string name="service_synth_notification_title">Marmalade TTS</string>
+    <string name="service_synth_notification_title_playing">Marmalade TTS - Playing</string>
+    <string name="service_synth_notification_title_paused">Marmalade TTS - Paused</string>
     <string name="service_synth_state_preparing">Preparing…</string>
     <string name="service_synth_state_queued">Queued: %1$s</string>
     <string name="service_synth_state_speaking_text">Speaking: %1$s</string>

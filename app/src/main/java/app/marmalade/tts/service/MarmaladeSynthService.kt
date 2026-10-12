@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
+import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
@@ -371,9 +372,10 @@ class MarmaladeSynthService : Service() {
      * exists since API 29 (Q), so we guard the type pass on Q+.
      */
     private fun promoteToForeground() {
-        val notification = buildNotification(
-            stateText = getString(R.string.service_synth_state_preparing),
-        )
+        val title = getString(R.string.service_synth_notification_title_playing)
+        val stateText = getString(R.string.service_synth_state_preparing)
+        updateMediaMetadata(title, stateText)
+        val notification = buildNotification(stateText)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -1518,11 +1520,21 @@ class MarmaladeSynthService : Service() {
                 PlaybackStateCompat.CustomAction.Builder(
                     CUSTOM_ACTION_STOP,
                     getString(R.string.service_synth_action_stop),
-                    android.R.drawable.ic_menu_close_clear_cancel,
+                    R.drawable.ic_media_stop,
                 ).build(),
             )
         }
         session.setPlaybackState(pb.build())
+    }
+
+    private fun updateMediaMetadata(title: String, subtitle: String) {
+        val session = mediaSession ?: return
+        val metadata = MediaMetadataCompat.Builder()
+            .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+            .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, subtitle)
+            .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, "Marmalade TTS")
+            .build()
+        session.setMetadata(metadata)
     }
 
     // -- notification ---------------------------------------------------------
@@ -1542,6 +1554,12 @@ class MarmaladeSynthService : Service() {
     }
 
     private fun updateNotification(stateText: String) {
+        val title = if (paused) {
+            getString(R.string.service_synth_notification_title_paused)
+        } else {
+            getString(R.string.service_synth_notification_title_playing)
+        }
+        updateMediaMetadata(title, stateText)
         val n = buildNotification(stateText)
         notificationManager?.notify(NOTIFICATION_ID, n)
     }
@@ -1590,7 +1608,7 @@ class MarmaladeSynthService : Service() {
             servicePendingIntent(ACTION_RESUME),
         )
         val stopAction = NotificationCompat.Action(
-            android.R.drawable.ic_menu_close_clear_cancel,
+            R.drawable.ic_media_stop,
             getString(R.string.service_synth_action_stop),
             servicePendingIntent(ACTION_STOP),
         )
@@ -1615,8 +1633,14 @@ class MarmaladeSynthService : Service() {
             add(stopAction)
         }
 
+        val title = if (paused) {
+            getString(R.string.service_synth_notification_title_paused)
+        } else {
+            getString(R.string.service_synth_notification_title_playing)
+        }
+
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.service_synth_notification_title))
+            .setContentTitle(title)
             .setContentText(stateText)
             .setSmallIcon(R.drawable.ic_stat_marmalade_speaking)
             .setOnlyAlertOnce(true)
@@ -1632,6 +1656,8 @@ class MarmaladeSynthService : Service() {
             val style = androidx.media.app.NotificationCompat.MediaStyle()
                 .setMediaSession(token)
                 .setShowActionsInCompactView(*compact)
+                .setShowCancelButton(true)
+                .setCancelButtonIntent(servicePendingIntent(ACTION_STOP))
             builder.setStyle(style)
         }
 

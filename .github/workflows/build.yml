@@ -1,0 +1,99 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install NDK r26d and CMake 3.22.1
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "ndk;26.3.11579264" "cmake;3.22.1"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare Kokoro Engine Assets (Pre-bake for offline use)
+        run: |
+          set -e
+          mkdir -p app/src/main/assets/engines-seed
+          echo "Downloading Kokoro direct v1.0 bundle..."
+          curl -L -o /tmp/kokoro.tar.gz https://github.com/maxwhipw/marmalade-tts-android-engines/releases/download/v23/kokoro-direct-v1_0.tar.gz
+          echo "8e8752c9ec937dd2842510b65a195ee48f2e2ddc7a2c69a478d281fefdd64770  /tmp/kokoro.tar.gz" | sha256sum -c -
+          echo "Extracting Kokoro assets..."
+          tar -xzf /tmp/kokoro.tar.gz -C app/src/main/assets/engines-seed/
+          # Drop legacy phonemizer data directory (apk already contains compiled espeak)
+          rm -rf app/src/main/assets/engines-seed/kokoro-direct-v1_0/phonemizer
+          rm /tmp/kokoro.tar.gz
+          ls -la app/src/main/assets/engines-seed/kokoro-direct-v1_0/
+
+      - name: Setup Build Signing Key
+        run: |
+          set -e
+          KEYSTORE_FILE="$RUNNER_TEMP/ci-signing.jks"
+          keytool -genkey -v -keystore "$KEYSTORE_FILE" \
+            -alias ci-key -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=MarmaladeTTS, OU=CI, O=Personal, L=City, S=State, C=US"
+
+          cat > keystore.properties <<EOF
+          storeFile=$KEYSTORE_FILE
+          storePassword=android
+          keyAlias=ci-key
+          keyPassword=android
+          distStoreFile=$KEYSTORE_FILE
+          distStorePassword=android
+          distKeyAlias=ci-key
+          distKeyPassword=android
+          EOF
+
+      - name: Build APKs
+        run: |
+          ./gradlew --no-daemon \
+            :app:assembleFdroidRelease \
+            :app:assembleFdroidDebug
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: marmalade-tts-kokoro-release
+          path: app/build/outputs/apk/fdroid/release/*.apk
+          retention-days: 30
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: marmalade-tts-kokoro-debug
+          path: app/build/outputs/apk/fdroid/debug/*.apk
+          retention-days: 30

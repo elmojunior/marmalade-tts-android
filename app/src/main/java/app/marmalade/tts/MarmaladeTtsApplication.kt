@@ -145,18 +145,23 @@ class MarmaladeTtsApplication : Application() {
         // the engine warm-up still proceeds, which is the part that kills
         // first-utterance latency. No-op when keepalive is Off.
         applicationScope.launch { keepalive.get().applyCurrentMode() }
-        // Seed the baked default engine (Kitten) from the APK assets on first
+        // Seed the baked default engines (Kitten and Kokoro) from the APK assets on first
         // run so a fresh install can speak immediately and offline — no
-        // download. Gated on a one-time flag, NOT on "is Kitten missing": a
-        // user who later uninstalls Kitten to reclaim space must stay
+        // download. Gated on a one-time flag, NOT on "is engine missing": a
+        // user who later uninstalls an engine to reclaim space must stay
         // uninstalled, so we seed exactly once ever. The flag is only set on
         // a successful seed, so a transient failure retries next launch.
         applicationScope.launch {
             val prefs = settings.get()
+            val installer = engineInstaller.get()
             if (!prefs.bakedDefaultSeeded.first()) {
-                val seeded = engineInstaller.get()
-                    .seedFromAssets(assets, KittenDirectVoiceCatalog.ENGINE)
-                if (seeded.isSuccess) prefs.setBakedDefaultSeeded(true)
+                val kittenSeeded = installer.seedFromAssets(assets, KittenDirectVoiceCatalog.ENGINE)
+                val kokoroSeeded = installer.seedFromAssets(assets, KokoroDirectVoiceCatalog.ENGINE)
+                if (kittenSeeded.isSuccess && kokoroSeeded.isSuccess) {
+                    prefs.setBakedDefaultSeeded(true)
+                }
+            } else {
+                installer.seedFromAssets(assets, KokoroDirectVoiceCatalog.ENGINE)
             }
         }
         applicationScope.launch {

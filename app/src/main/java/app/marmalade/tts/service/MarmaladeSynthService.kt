@@ -60,6 +60,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.SendChannel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -273,6 +275,11 @@ class MarmaladeSynthService : Service() {
      */
     private var activePrepared: Prepared? = null
 
+    @Volatile private var currentDurationMs: Long = 0L
+    @Volatile private var currentRequest: SpeakRequest? = null
+    @Volatile private var lastStateText: String = ""
+    private var progressJob: Job? = null
+
     /**
      * Newest start id delivered to [onStartCommand]. Stopping with
      * `stopSelfResult(lastStartId)` rather than a bare `stopSelf()` leaves
@@ -348,6 +355,7 @@ class MarmaladeSynthService : Service() {
             null -> Unit
             ACTION_PAUSE -> doPause()
             ACTION_RESUME -> doResume()
+            ACTION_RESTART -> doRestart()
             ACTION_STOP -> doStop()
             ACTION_STOP_REQUEST ->
                 doStopRequest(intent.getLongExtra(EXTRA_REQUEST_ID, 0L))
@@ -374,7 +382,8 @@ class MarmaladeSynthService : Service() {
     private fun promoteToForeground() {
         val title = getString(R.string.service_synth_notification_title_playing)
         val stateText = getString(R.string.service_synth_state_preparing)
-        updateMediaMetadata(title, stateText)
+        lastStateText = stateText
+        updateMediaMetadata(title, stateText, 0L)
         val notification = buildNotification(stateText)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
@@ -527,6 +536,7 @@ class MarmaladeSynthService : Service() {
     private fun startNextLocked() {
         val next = queue.pollFirst() ?: run {
             // Nothing left to do — release focus + foreground.
+            stopProgressUpdates()
             stopIfIdle()
             return
         }
@@ -539,6 +549,14 @@ class MarmaladeSynthService : Service() {
         // here is FGS-from-FGS, which is always allowed.
         keepaliveCoordinator.onSynthCompleted()
         activeRequestId = next.requestId
+        currentRequest = next
+        currentDurationMs = estimateDurationMs(next.text, next.speed)
+        lastStateText = getString(R.string.service_synth_state_preparing)
+        updateMediaMetadata(
+            getString(R.string.service_synth_notification_title_playing),
+            lastStateText,
+            currentDurationMs,
+        )
         // Advertise transport controls from the start, not from the first
         // audio: until the session has a state it offers no actions, and a
         // headset/Bluetooth stop or pause during a slow engine's time-to-
@@ -562,6 +580,7 @@ class MarmaladeSynthService : Service() {
                     if (queue.isNotEmpty()) {
                         startNextLocked()
                     } else {
+                        stopProgressUpdates()
                         stopIfIdle()
                     }
                 }
@@ -1003,6 +1022,16 @@ class MarmaladeSynthService : Service() {
             }
             lastResume = System.nanoTime()
         }
+        if (audioSamples > 0 && sampleRate > 0) {
+            val exactDurationMs = (audioSamples * 1000L) / sampleRate
+            currentDurationMs = exactDurationMs
+            val title = if (paused) {
+                getString(R.string.service_synth_notification_title_paused)
+            } else {
+                getString(R.string.service_synth_notification_title_playing)
+            }
+            updateMediaMetadata(title, lastStateText, exactDurationMs)
+        }
         engineRtfSample(warm, skewed, renderNanos, audioSamples, sampleRate)
             ?.let { recordEngineRtf(engineName, it) }
     }
@@ -1041,7 +1070,19 @@ class MarmaladeSynthService : Service() {
         )
         when (result) {
             is PipelineResult.Empty -> return
-            is PipelineResult.Audio -> channel.send(SynthAudio(result.pcm, result.sampleRate))
+            is PipelineResult.Audio -> {
+                if (result.sampleRate > 0) {
+                    val exactDurationMs = (result.pcm.size.toLong() * 1000L) / result.sampleRate
+                    currentDurationMs = exactDurationMs
+                    val title = if (paused) {
+                        getString(R.string.service_synth_notification_title_paused)
+                    } else {
+                        getString(R.string.service_synth_notification_title_playing)
+                    }
+                    updateMediaMetadata(title, lastStateText, exactDurationMs)
+                }
+                channel.send(SynthAudio(result.pcm, result.sampleRate))
+            }
         }
     }
 
@@ -1107,6 +1148,7 @@ class MarmaladeSynthService : Service() {
             setPaused(true)
             releaseWakeLock()
         }
+        stopProgressUpdates()
         currentTrack?.let { track ->
             try {
                 if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.pause()
@@ -1117,7 +1159,8 @@ class MarmaladeSynthService : Service() {
         // service has nothing to show: a notification posted there would
         // outlive the stopIfIdle that follows, as it was never foreground.
         if (!hasWork()) return
-        updateMediaState(PlaybackStateCompat.STATE_PAUSED)
+        val pos = currentPositionMs()
+        updateMediaState(PlaybackStateCompat.STATE_PAUSED, pos)
         updateNotification(getString(R.string.service_synth_state_paused))
     }
 
@@ -1131,8 +1174,10 @@ class MarmaladeSynthService : Service() {
         }
         if (!hasWork()) return
         holdWakeLock()
-        updateMediaState(PlaybackStateCompat.STATE_PLAYING)
+        val pos = currentPositionMs()
+        updateMediaState(PlaybackStateCompat.STATE_PLAYING, pos)
         updateNotification(getString(R.string.service_synth_state_speaking))
+        startProgressUpdates()
     }
 
     /** A request is playing or queued. */
@@ -1186,6 +1231,8 @@ class MarmaladeSynthService : Service() {
     }
 
     private fun doStop() {
+        stopProgressUpdates()
+        currentDurationMs = 0L
         synchronized(lock) {
             cancelAllLocked()
             releaseWakeLock()
@@ -1195,6 +1242,23 @@ class MarmaladeSynthService : Service() {
         updateMediaState(PlaybackStateCompat.STATE_STOPPED)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelfResult(lastStartId)
+    }
+
+    private fun doRestart() {
+        if (transport.reader.value.isReading) {
+            readerPlayback.playFrom(0)
+            return
+        }
+        val req = synchronized(lock) { currentRequest } ?: return
+        val replacedTrack = synchronized(lock) {
+            cancelAllLocked()
+            queue.addLast(req.copy())
+            if (activeJob == null) {
+                startNextLocked()
+            }
+            currentTrack
+        }
+        replacedTrack?.let(::haltTrack)
     }
 
     /**
@@ -1413,6 +1477,7 @@ class MarmaladeSynthService : Service() {
                         } else {
                             updateMediaState(PlaybackStateCompat.STATE_PLAYING)
                             it.play()
+                            startProgressUpdates()
                         }
                     }
                     // Published before the first chunk was sent.
@@ -1440,6 +1505,7 @@ class MarmaladeSynthService : Service() {
                 }
                 track?.let { drainTrack(it, written) }
             } finally {
+                stopProgressUpdates()
                 track?.let { releaseTrack(it) }
             }
         }
@@ -1459,6 +1525,44 @@ class MarmaladeSynthService : Service() {
 
     // -- media session --------------------------------------------------------
 
+    private fun currentPositionMs(): Long {
+        val track = currentTrack ?: return 0L
+        return try {
+            val head = track.playbackHeadPosition.toLong()
+            val rate = track.sampleRate
+            if (rate > 0) (head * 1000L) / rate else 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    private fun estimateDurationMs(text: String, speed: Float): Long {
+        if (text.isBlank()) return 0L
+        val effectiveSpeed = if (speed > 0.1f) speed else 1.0f
+        // Average speaking rate: ~15 characters per second at 1.0x speed
+        val seconds = text.length / (15.0f * effectiveSpeed)
+        return (seconds * 1000).toLong().coerceAtLeast(1000L)
+    }
+
+    private fun startProgressUpdates() {
+        stopProgressUpdates()
+        progressJob = scope.launch {
+            while (isActive) {
+                delay(1000L)
+                if (paused || cancelled) continue
+                if (currentTrack != null && currentDurationMs > 0) {
+                    val n = buildNotification(lastStateText)
+                    notificationManager?.notify(NOTIFICATION_ID, n)
+                }
+            }
+        }
+    }
+
+    private fun stopProgressUpdates() {
+        progressJob?.cancel()
+        progressJob = null
+    }
+
     private fun ensureMediaSession() {
         if (mediaSession != null) return
         val session = MediaSessionCompat(this, "MarmaladeSynth")
@@ -1466,6 +1570,7 @@ class MarmaladeSynthService : Service() {
             override fun onPlay() = doResume()
             override fun onPause() = doPause()
             override fun onStop() = doStop()
+            override fun onRewind() = doRestart()
 
             // A headset's play/pause toggle resolves to onPlay for any state
             // but PLAYING (MediaSession's default handling), so while the
@@ -1487,35 +1592,51 @@ class MarmaladeSynthService : Service() {
             }
 
             // Headset / Bluetooth track-skip buttons step the article while
-            // the reader owns playback. For every other kind of speech there
-            // is no "next track", so they stay the no-ops they always were.
+            // the reader owns playback. For ordinary speech, skip to previous
+            // restarts the utterance.
             override fun onSkipToNext() {
                 if (transport.reader.value.isReading) readerPlayback.next()
             }
 
             override fun onSkipToPrevious() {
                 if (transport.reader.value.isReading) readerPlayback.previous()
+                else doRestart()
+            }
+
+            override fun onSeekTo(pos: Long) {
+                if (pos <= 1000L) doRestart()
             }
 
             override fun onCustomAction(action: String?, extras: Bundle?) {
-                if (action == CUSTOM_ACTION_STOP) doStop()
+                when (action) {
+                    CUSTOM_ACTION_STOP -> doStop()
+                    CUSTOM_ACTION_RESTART -> doRestart()
+                }
             }
         })
         session.isActive = true
         mediaSession = session
     }
 
-    private fun updateMediaState(state: Int) {
+    private fun updateMediaState(state: Int, positionMs: Long = currentPositionMs()) {
         mediaState = state
         val session = mediaSession ?: return
+        val speed = if (state == PlaybackStateCompat.STATE_PLAYING) 1.0f else 0.0f
         val pb = PlaybackStateCompat.Builder()
             .setActions(sessionActions(transport.reader.value))
-            .setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+            .setState(state, positionMs, speed, SystemClock.elapsedRealtime())
         // Android 13+ builds the shade's media controls from this state, not
         // from the notification's actions, and ACTION_STOP has no button
         // there — Stop only shows as a custom action. Older versions keep
         // using the notification's own Stop (buildNotification).
         if (showsStopControl(state)) {
+            pb.addCustomAction(
+                PlaybackStateCompat.CustomAction.Builder(
+                    CUSTOM_ACTION_RESTART,
+                    getString(R.string.service_synth_action_restart),
+                    R.drawable.ic_media_restart,
+                ).build(),
+            )
             pb.addCustomAction(
                 PlaybackStateCompat.CustomAction.Builder(
                     CUSTOM_ACTION_STOP,
@@ -1527,14 +1648,20 @@ class MarmaladeSynthService : Service() {
         session.setPlaybackState(pb.build())
     }
 
-    private fun updateMediaMetadata(title: String, subtitle: String) {
+    private fun updateMediaMetadata(
+        title: String,
+        subtitle: String,
+        durationMs: Long = currentDurationMs,
+    ) {
         val session = mediaSession ?: return
         val metadata = MediaMetadataCompat.Builder()
             .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
             .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, subtitle)
             .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, "Marmalade TTS")
-            .build()
-        session.setMetadata(metadata)
+        if (durationMs > 0) {
+            metadata.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs)
+        }
+        session.setMetadata(metadata.build())
     }
 
     // -- notification ---------------------------------------------------------
@@ -1554,12 +1681,13 @@ class MarmaladeSynthService : Service() {
     }
 
     private fun updateNotification(stateText: String) {
+        lastStateText = stateText
         val title = if (paused) {
             getString(R.string.service_synth_notification_title_paused)
         } else {
             getString(R.string.service_synth_notification_title_playing)
         }
-        updateMediaMetadata(title, stateText)
+        updateMediaMetadata(title, stateText, currentDurationMs)
         val n = buildNotification(stateText)
         notificationManager?.notify(NOTIFICATION_ID, n)
     }
@@ -1587,16 +1715,20 @@ class MarmaladeSynthService : Service() {
      * The foreground notification.
      *
      * Two shapes. For ordinary speech — share sheet, Speak screen —
-     * it is what it has always been: pause/resume and stop, both in
-     * the compact view, and no tap target. While the reader is mid-article it
-     * additionally grows previous/next-block buttons around the pause, and
-     * tapping it reopens the article (reader-mode design point 7).
+     * it features restart, play/pause and stop in the compact view.
+     * While the reader is mid-article it additionally grows previous/next-block
+     * buttons around the pause, and tapping it reopens the article (reader-mode design point 7).
      */
     private fun buildNotification(stateText: String): Notification {
         val session = mediaSession
         val token = session?.sessionToken
         val reader = transport.reader.value
 
+        val restartAction = NotificationCompat.Action(
+            R.drawable.ic_media_restart,
+            getString(R.string.service_synth_action_restart),
+            servicePendingIntent(ACTION_RESTART),
+        )
         val pauseAction = NotificationCompat.Action(
             android.R.drawable.ic_media_pause,
             getString(R.string.service_synth_action_pause),
@@ -1623,13 +1755,17 @@ class MarmaladeSynthService : Service() {
             servicePendingIntent(ACTION_READER_NEXT),
         )
 
-        // Transport order, so the compact view (which takes the first three)
-        // reads previous / play-pause / next like every other media
-        // notification. Stop trails behind in the expanded view.
+        // Order: Restart (circular arrow left), Play/Pause, Stop (square stop)
         val actions = buildList {
-            if (reader.isReading && reader.canPrevious) add(previousAction)
+            if (reader.isReading && reader.canPrevious) {
+                add(previousAction)
+            } else {
+                add(restartAction)
+            }
             add(if (paused) resumeAction else pauseAction)
-            if (reader.isReading && reader.canNext) add(nextAction)
+            if (reader.isReading && reader.canNext) {
+                add(nextAction)
+            }
             add(stopAction)
         }
 
@@ -1646,6 +1782,14 @@ class MarmaladeSynthService : Service() {
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+
+        val duration = currentDurationMs
+        if (duration > 0) {
+            val max = (duration / 1000).toInt().coerceAtLeast(1)
+            val progress = (currentPositionMs() / 1000).toInt().coerceIn(0, max)
+            builder.setProgress(max, progress, false)
+        }
+
         actions.forEach(builder::addAction)
         reader.articleUrl?.takeIf { reader.isReading }?.let { url ->
             builder.setContentIntent(readerPendingIntent(url))
@@ -1869,12 +2013,16 @@ class MarmaladeSynthService : Service() {
             var actions = PlaybackStateCompat.ACTION_PLAY or
                 PlaybackStateCompat.ACTION_PAUSE or
                 PlaybackStateCompat.ACTION_STOP or
-                PlaybackStateCompat.ACTION_PLAY_PAUSE
+                PlaybackStateCompat.ACTION_PLAY_PAUSE or
+                PlaybackStateCompat.ACTION_REWIND or
+                PlaybackStateCompat.ACTION_SEEK_TO
             if (reader.isReading) {
                 if (reader.canNext) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_NEXT
                 if (reader.canPrevious) {
                     actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
                 }
+            } else {
+                actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
             }
             return actions
         }
@@ -1898,7 +2046,8 @@ class MarmaladeSynthService : Service() {
             state == PlaybackStateCompat.STATE_BUFFERING &&
                 (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE || keyCode == KeyEvent.KEYCODE_HEADSETHOOK)
 
-        /** The media session's Stop, as a custom action — see [updateMediaState]. */
+        /** The media session's Restart and Stop, as custom actions — see [updateMediaState]. */
+        internal const val CUSTOM_ACTION_RESTART = "app.marmalade.tts.media.RESTART"
         internal const val CUSTOM_ACTION_STOP = "app.marmalade.tts.media.STOP"
 
         /** Whether the session's controls offer Stop: while there is anything to stop. */
@@ -1961,6 +2110,7 @@ class MarmaladeSynthService : Service() {
         const val ACTION_SPEAK: String = "app.marmalade.tts.action.SPEAK"
         const val ACTION_PAUSE: String = "app.marmalade.tts.action.PAUSE"
         const val ACTION_RESUME: String = "app.marmalade.tts.action.RESUME"
+        const val ACTION_RESTART: String = "app.marmalade.tts.action.RESTART"
         const val ACTION_STOP: String = "app.marmalade.tts.action.STOP"
 
         /**

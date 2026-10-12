@@ -13,6 +13,7 @@
     <string name="service_synth_state_paused">Paused</string>
     <string name="service_synth_action_pause">Pause</string>
     <string name="service_synth_action_resume">Resume</string>
+    <string name="service_synth_action_restart">Restart</string>
     <string name="service_synth_action_stop">Stop</string>
     <string name="service_synth_action_previous_block">Previous</string>
     <string name="service_synth_action_next_block">Next</string>

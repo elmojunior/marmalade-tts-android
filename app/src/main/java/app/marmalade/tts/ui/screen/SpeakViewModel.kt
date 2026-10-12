@@ -632,17 +632,25 @@ class SpeakViewModel @Inject constructor(
         )
     }
 
-    /** Restart playback from the beginning. */
+    /** Restart playback from the beginning without cancelling active session. */
     fun restart() {
-        if (_text.value.isNotBlank()) {
-            cancel()
+        if (isTransportActive.value || isPaused.value) {
+            seekTo(0L)
+            if (isPaused.value) {
+                resume()
+            }
+        } else if (_text.value.isNotBlank()) {
             speak()
-        } else {
-            context.startService(
-                Intent(context, MarmaladeSynthService::class.java)
-                    .setAction(MarmaladeSynthService.ACTION_RESTART),
-            )
         }
+    }
+
+    /** Seek playback to a specific timestamp in milliseconds. */
+    fun seekTo(positionMs: Long) {
+        context.startService(
+            Intent(context, MarmaladeSynthService::class.java)
+                .setAction(MarmaladeSynthService.ACTION_SEEK_TO)
+                .putExtra(MarmaladeSynthService.EXTRA_SEEK_MS, positionMs),
+        )
     }
 
     /** Stop any in-flight playback and silence service. */

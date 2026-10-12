@@ -281,6 +281,11 @@ class MarmaladeSynthService : Service() {
     @Volatile private var currentDurationMs: Long = 0L
     @Volatile private var currentRequest: SpeakRequest? = null
     @Volatile private var lastStateText: String = ""
+    @Volatile private var currentAudioBuffer: UtteranceAudioBuffer? = null
+    @Volatile private var playbackOffsetSamples: Long = 0L
+    @Volatile private var currentSampleRate: Int = 24000
+    @Volatile private var seekRequestedMs: Long? = null
+    @Volatile private var trackWritten: Int = 0
     private var progressJob: Job? = null
 
     /**
@@ -359,6 +364,10 @@ class MarmaladeSynthService : Service() {
             ACTION_PAUSE -> doPause()
             ACTION_RESUME -> doResume()
             ACTION_RESTART -> doRestart()
+            ACTION_SEEK_TO -> {
+                val pos = intent?.getLongExtra(EXTRA_SEEK_MS, 0L) ?: 0L
+                doSeekTo(pos)
+            }
             ACTION_STOP -> doStop()
             ACTION_STOP_REQUEST ->
                 doStopRequest(intent.getLongExtra(EXTRA_REQUEST_ID, 0L))
@@ -1241,9 +1250,25 @@ class MarmaladeSynthService : Service() {
         currentTrack?.let(::haltTrack)
     }
 
+    private fun doSeekTo(posMs: Long) {
+        val dur = currentDurationMs
+        val targetMs = if (dur > 0) posMs.coerceIn(0L, dur) else posMs.coerceAtLeast(0L)
+        synchronized(lock) {
+            seekRequestedMs = targetMs
+        }
+        currentTrack?.let(::haltTrack)
+        val pos = targetMs
+        transport.setProgress(pos, dur)
+        updateMediaState(if (paused) PlaybackStateCompat.STATE_PAUSED else PlaybackStateCompat.STATE_PLAYING, pos)
+        updateNotification(lastStateText)
+    }
+
     private fun doStop() {
         stopProgressUpdates()
         currentDurationMs = 0L
+        seekRequestedMs = null
+        playbackOffsetSamples = 0L
+        currentAudioBuffer = null
         transport.setActive(false)
         synchronized(lock) {
             cancelAllLocked()
@@ -1261,16 +1286,13 @@ class MarmaladeSynthService : Service() {
             readerPlayback.playFrom(0)
             return
         }
-        val req = synchronized(lock) { currentRequest } ?: return
-        val replacedTrack = synchronized(lock) {
-            cancelAllLocked()
-            queue.addLast(req.copy())
-            if (activeJob == null) {
-                startNextLocked()
-            }
-            currentTrack
+        if (hasWork() && currentAudioBuffer != null) {
+            doSeekTo(0L)
+            if (paused) doResume()
+        } else {
+            val req = synchronized(lock) { currentRequest } ?: return
+            enqueue(req.copy())
         }
-        replacedTrack?.let(::haltTrack)
     }
 
     /**
@@ -1397,13 +1419,13 @@ class MarmaladeSynthService : Service() {
      */
     private fun writePcm(track: AudioTrack, pcm: ShortArray): Int {
         var written = 0
-        while (written < pcm.size && !cancelled) {
-            while (paused && !cancelled) {
+        while (written < pcm.size && !cancelled && seekRequestedMs == null) {
+            while (paused && !cancelled && seekRequestedMs == null) {
                 try { Thread.sleep(50L) } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt(); break
                 }
             }
-            if (cancelled) break
+            if (cancelled || seekRequestedMs != null) break
             val n = track.write(pcm, written, pcm.size - written, AudioTrack.WRITE_BLOCKING)
             if (n <= 0) {
                 Log.w(TAG, "AudioTrack.write returned $n; aborting")
@@ -1426,7 +1448,7 @@ class MarmaladeSynthService : Service() {
     private fun drainTrack(track: AudioTrack, written: Int) {
         var lastPos = -1
         var lastProgressAt = SystemClock.elapsedRealtime()
-        while (!cancelled) {
+        while (!cancelled && seekRequestedMs == null) {
             val pos = try { track.playbackHeadPosition } catch (_: IllegalStateException) { written }
             if (pos >= written) break
             val now = SystemClock.elapsedRealtime()
@@ -1451,19 +1473,53 @@ class MarmaladeSynthService : Service() {
         if (currentTrack === track) currentTrack = null
     }
 
+    private fun flattenPcm(list: List<ShortArray>): ShortArray {
+        val total = list.sumOf { it.size }
+        val out = ShortArray(total)
+        var offset = 0
+        for (arr in list) {
+            System.arraycopy(arr, 0, out, offset, arr.size)
+            offset += arr.size
+        }
+        return out
+    }
+
+    private fun handlePendingSeek(audioBuffer: UtteranceAudioBuffer): Boolean {
+        val seekMs = synchronized(lock) {
+            seekRequestedMs?.also { seekRequestedMs = null }
+        } ?: return false
+
+        currentTrack?.let { releaseTrack(it) }
+        currentTrack = null
+
+        val sr = currentSampleRate.coerceAtLeast(1)
+        val targetSample = ((seekMs * sr) / 1000L).toInt().coerceIn(0, audioBuffer.totalSamples)
+        playbackOffsetSamples = targetSample.toLong()
+
+        val newTrack = buildTrack(sr)
+        currentTrack = newTrack
+        trackWritten = 0
+
+        if (paused) {
+            updateMediaState(PlaybackStateCompat.STATE_PAUSED, seekMs)
+        } else {
+            updateMediaState(PlaybackStateCompat.STATE_PLAYING, seekMs)
+            newTrack.play()
+            startProgressUpdates()
+        }
+
+        val chunks = audioBuffer.getChunksFrom(targetSample)
+        for (chunk in chunks) {
+            if (cancelled || seekRequestedMs != null) break
+            trackWritten += writePcm(newTrack, chunk)
+        }
+        return true
+    }
+
     /**
      * Consumer half of the pipeline: open the AudioTrack lazily on the
      * first chunk (its sample rate sets the format), shape and write chunks
-     * as they arrive, then drain. Pause blocks this consumer, which
-     * backpressures the producer through the channel. Each chunk re-arms the
-     * wake lock.
-     *
-     * The effect chain runs here, on the engine's raw PCM, in slices of
-     * ~100 ms written one at a time. That is what makes a live session-speed
-     * change ([Shaping.liveTempo]) audible within the AudioTrack's ~250 ms
-     * buffer: the speed is re-read before every slice, whereas one chunk is a
-     * whole sentence or more. Slicing doesn't change the output — the chain
-     * is continuous across seams (StreamingEffectChainTest, chunked == whole).
+     * as they arrive, and buffer all rendered audio so seeks and restarts are instant.
      */
     private suspend fun playFromChannel(prepared: Prepared) =
         withContext(Dispatchers.IO) {
@@ -1471,54 +1527,104 @@ class MarmaladeSynthService : Service() {
             var track: AudioTrack? = null
             var chain: StreamingEffectChain? = null
             var shaping: Shaping? = null
-            var written = 0
+
+            val audioBuffer = UtteranceAudioBuffer()
+            currentAudioBuffer = audioBuffer
+            playbackOffsetSamples = 0L
+            seekRequestedMs = null
+            trackWritten = 0
+
             try {
                 for (audio in channel) {
                     if (cancelled) break
                     holdWakeLock()
+                    currentSampleRate = audio.sampleRate
+
+                    val s = shaping ?: prepared.shaping.await().also { shaping = it }
+                    val c = chain ?: StreamingEffectChain(s.blocks, audio.sampleRate, s.liveTempo)
+                        .also { chain = it }
+
+                    val processed: ShortArray = if (c.isEmpty) {
+                        audio.pcm
+                    } else {
+                        val slice = (audio.sampleRate / 10).coerceAtLeast(1)
+                        var from = 0
+                        val list = mutableListOf<ShortArray>()
+                        while (from < audio.pcm.size && !cancelled) {
+                            s.liveRequestId?.let { followLiveSpeed(c, it) }
+                            val to = minOf(from + slice, audio.pcm.size)
+                            list.add(c.process(audio.pcm.copyOfRange(from, to)))
+                            from = to
+                        }
+                        flattenPcm(list)
+                    }
+
+                    audioBuffer.add(processed)
+
+                    if (handlePendingSeek(audioBuffer)) {
+                        track = currentTrack
+                        continue
+                    }
+
                     val t = track ?: buildTrack(audio.sampleRate).also {
                         track = it
                         currentTrack = it
-                        // Paused before the first chunk (during time-to-
-                        // first-audio): the track starts paused and doResume
-                        // plays it. currentTrack is published first, so a
-                        // resume racing this either sees the track or has
-                        // already cleared the flag read below.
+                        trackWritten = 0
                         if (paused) {
-                            updateMediaState(PlaybackStateCompat.STATE_PAUSED)
+                            updateMediaState(PlaybackStateCompat.STATE_PAUSED, currentPositionMs())
                         } else {
-                            updateMediaState(PlaybackStateCompat.STATE_PLAYING)
+                            updateMediaState(PlaybackStateCompat.STATE_PLAYING, currentPositionMs())
                             it.play()
                             startProgressUpdates()
                         }
                     }
-                    // Published before the first chunk was sent.
-                    val s = shaping ?: prepared.shaping.await().also { shaping = it }
-                    val c = chain ?: StreamingEffectChain(s.blocks, audio.sampleRate, s.liveTempo)
-                        .also { chain = it }
-                    if (c.isEmpty) {
-                        written += writePcm(t, audio.pcm)
+
+                    trackWritten += writePcm(t, processed)
+                    if (handlePendingSeek(audioBuffer)) {
+                        track = currentTrack
+                    }
+                }
+
+                if (!cancelled) {
+                    chain?.flush()?.takeIf { it.isNotEmpty() }?.let { flushed ->
+                        audioBuffer.add(flushed)
+                        if (handlePendingSeek(audioBuffer)) {
+                            track = currentTrack
+                        } else {
+                            val sr = currentSampleRate
+                            val t = track ?: buildTrack(sr).also {
+                                track = it
+                                currentTrack = it
+                                trackWritten = 0
+                                if (!paused) {
+                                    it.play()
+                                    startProgressUpdates()
+                                }
+                            }
+                            trackWritten += writePcm(t, flushed)
+                        }
+                    }
+                }
+
+                while (!cancelled) {
+                    if (handlePendingSeek(audioBuffer)) {
+                        track = currentTrack
                         continue
                     }
-                    val slice = (audio.sampleRate / 10).coerceAtLeast(1)
-                    var from = 0
-                    while (from < audio.pcm.size && !cancelled) {
-                        s.liveRequestId?.let { followLiveSpeed(c, it) }
-                        val to = minOf(from + slice, audio.pcm.size)
-                        written += writePcm(t, c.process(audio.pcm.copyOfRange(from, to)))
-                        from = to
+                    val t = currentTrack
+                    if (t != null) {
+                        drainTrack(t, trackWritten)
+                        if (seekRequestedMs != null) continue
                     }
+                    break
                 }
-                // The channel ended cleanly: the chain's tail (Tempo's last
-                // frame, a reverb ring-out) is still owed.
-                val t = track
-                if (t != null && !cancelled) {
-                    chain?.flush()?.takeIf { it.isNotEmpty() }?.let { written += writePcm(t, it) }
-                }
-                track?.let { drainTrack(it, written) }
             } finally {
                 stopProgressUpdates()
-                track?.let { releaseTrack(it) }
+                currentTrack?.let { releaseTrack(it) }
+                currentAudioBuffer = null
+                playbackOffsetSamples = 0L
+                seekRequestedMs = null
+                trackWritten = 0
             }
         }
 
@@ -1538,13 +1644,16 @@ class MarmaladeSynthService : Service() {
     // -- media session --------------------------------------------------------
 
     private fun currentPositionMs(): Long {
-        val track = currentTrack ?: return 0L
+        val track = currentTrack
+        val rate = currentSampleRate.coerceAtLeast(1)
+        if (track == null) {
+            return (playbackOffsetSamples * 1000L) / rate
+        }
         return try {
             val head = track.playbackHeadPosition.toLong()
-            val rate = track.sampleRate
-            if (rate > 0) (head * 1000L) / rate else 0L
+            ((playbackOffsetSamples + head) * 1000L) / rate
         } catch (_: Exception) {
-            0L
+            (playbackOffsetSamples * 1000L) / rate
         }
     }
 
@@ -1604,7 +1713,7 @@ class MarmaladeSynthService : Service() {
             override fun onPlay() = doResume()
             override fun onPause() = doPause()
             override fun onStop() = doStop()
-            override fun onRewind() = doRestart()
+            override fun onRewind() = doSeekTo(0L)
 
             // A headset's play/pause toggle resolves to onPlay for any state
             // but PLAYING (MediaSession's default handling), so while the
@@ -1634,12 +1743,10 @@ class MarmaladeSynthService : Service() {
 
             override fun onSkipToPrevious() {
                 if (transport.reader.value.isReading) readerPlayback.previous()
-                else doRestart()
+                else doSeekTo(0L)
             }
 
-            override fun onSeekTo(pos: Long) {
-                if (pos <= 1000L) doRestart()
-            }
+            override fun onSeekTo(pos: Long) = doSeekTo(pos)
 
             override fun onCustomAction(action: String?, extras: Bundle?) {
                 when (action) {
@@ -1840,7 +1947,11 @@ class MarmaladeSynthService : Service() {
         }
 
         if (token != null) {
-            val compact = IntArray(minOf(COMPACT_ACTIONS, actions.size)) { it }
+            val compact = if (!reader.isReading) {
+                intArrayOf(0, 1, 2)
+            } else {
+                IntArray(minOf(COMPACT_ACTIONS, actions.size)) { it }
+            }
             val style = androidx.media.app.NotificationCompat.MediaStyle()
                 .setMediaSession(token)
                 .setShowActionsInCompactView(*compact)
@@ -1905,6 +2016,43 @@ class MarmaladeSynthService : Service() {
         companion object {
             /** Audio that arrives already shaped (the batched path), or none at all. */
             val PASSTHROUGH = Shaping(emptyList())
+        }
+    }
+
+    /** Thread-safe PCM buffer for the currently playing utterance to enable seeking and instant restart. */
+    private class UtteranceAudioBuffer {
+        private val chunks = ArrayList<ShortArray>()
+        var totalSamples: Int = 0
+            private set
+
+        fun add(pcm: ShortArray) {
+            synchronized(this) {
+                chunks.add(pcm)
+                totalSamples += pcm.size
+            }
+        }
+
+        fun getChunksFrom(startSample: Int): List<ShortArray> {
+            synchronized(this) {
+                if (startSample >= totalSamples || chunks.isEmpty()) return emptyList()
+                val result = ArrayList<ShortArray>()
+                var currentOffset = 0
+                for (chunk in chunks) {
+                    val chunkEnd = currentOffset + chunk.size
+                    if (chunkEnd <= startSample) {
+                        currentOffset = chunkEnd
+                        continue
+                    }
+                    if (currentOffset <= startSample && startSample < chunkEnd) {
+                        val offsetInChunk = startSample - currentOffset
+                        result.add(chunk.copyOfRange(offsetInChunk, chunk.size))
+                    } else {
+                        result.add(chunk)
+                    }
+                    currentOffset = chunkEnd
+                }
+                return result
+            }
         }
     }
 
@@ -2065,8 +2213,6 @@ class MarmaladeSynthService : Service() {
                 if (reader.canPrevious) {
                     actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
                 }
-            } else {
-                actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
             }
             return actions
         }
@@ -2155,6 +2301,8 @@ class MarmaladeSynthService : Service() {
         const val ACTION_PAUSE: String = "app.marmalade.tts.action.PAUSE"
         const val ACTION_RESUME: String = "app.marmalade.tts.action.RESUME"
         const val ACTION_RESTART: String = "app.marmalade.tts.action.RESTART"
+        const val ACTION_SEEK_TO: String = "app.marmalade.tts.action.SEEK_TO"
+        const val EXTRA_SEEK_MS: String = "app.marmalade.tts.extra.SEEK_MS"
         const val ACTION_STOP: String = "app.marmalade.tts.action.STOP"
 
         /**

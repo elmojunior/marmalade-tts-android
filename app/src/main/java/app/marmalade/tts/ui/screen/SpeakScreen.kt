@@ -35,6 +35,8 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -42,7 +44,9 @@ import java.util.Locale
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -168,6 +172,15 @@ fun SpeakScreen(
     // onScreenEntered for why no flow catches this case.
     LaunchedEffect(Unit) { viewModel.onScreenEntered() }
 
+    var sliderPosition by remember { mutableFloatStateOf(0f) }
+    var isDragging by remember { mutableStateOf(false) }
+
+    LaunchedEffect(currentPositionMs, isDragging) {
+        if (!isDragging) {
+            sliderPosition = currentPositionMs.toFloat()
+        }
+    }
+
     // Loading (cold engine paging in) is Speaking's twin for every control:
     // work the user asked for is in flight, and Stop must stay reachable so
     // a slow load can be abandoned. Only the status line tells them apart.
@@ -261,10 +274,19 @@ fun SpeakScreen(
 
             Spacer(Modifier.height(10.dp))
 
-            // Playback progress bar directly above the buttons
+            // Playback progress slider directly above the buttons
             Column(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 2.dp),
             ) {
+                val totalMs = durationMs.toFloat().coerceAtLeast(1f)
+                val currentMs = if (isDragging) {
+                    sliderPosition.coerceIn(0f, totalMs)
+                } else {
+                    currentPositionMs.toFloat().coerceIn(0f, totalMs)
+                }
+
                 if (isSpeaking && !isPaused && durationMs == 0L) {
                     LinearProgressIndicator(
                         modifier = Modifier
@@ -274,22 +296,33 @@ fun SpeakScreen(
                         trackColor = MaterialTheme.colorScheme.surfaceVariant,
                     )
                 } else {
-                    LinearProgressIndicator(
-                        progress = { if (durationMs > 0L) progress else 0f },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(6.dp),
-                        color = MaterialTheme.colorScheme.primary,
-                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    Slider(
+                        value = currentMs,
+                        onValueChange = { newPos ->
+                            isDragging = true
+                            sliderPosition = newPos
+                        },
+                        onValueChangeFinished = {
+                            isDragging = false
+                            viewModel.seekTo(sliderPosition.toLong())
+                        },
+                        valueRange = 0f..totalMs,
+                        enabled = (isSpeaking || isPaused || isTransportActive) && durationMs > 0L,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = SliderDefaults.colors(
+                            thumbColor = MaterialTheme.colorScheme.primary,
+                            activeTrackColor = MaterialTheme.colorScheme.primary,
+                            inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant,
+                        ),
                     )
                 }
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(2.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(
-                        text = formatDuration(currentPositionMs),
+                        text = formatDuration(if (isDragging) sliderPosition.toLong() else currentPositionMs),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

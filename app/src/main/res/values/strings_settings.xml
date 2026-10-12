@@ -14,6 +14,8 @@
     <string name="settings_system_integration">System integration</string>
     <string name="settings_set_system_engine">Set as system TTS engine</string>
     <string name="settings_set_system_engine_desc">Opens Android\'s text-to-speech settings so you can pick Marmalade as the default engine. Required for external apps to route TTS through us.</string>
+    <string name="settings_portuguese_voice_title">Portuguese (Brazil) voice</string>
+    <string name="settings_portuguese_voice_desc">Voice used when system TTS or apps request Portuguese. Jessica speaks natural Portuguese using Kokoro phonemization.</string>
 
     <string name="settings_keepalive">Keep engine loaded</string>
     <string name="settings_keepalive_off">Off</string>

@@ -455,11 +455,18 @@ class MarmaladeTtsService : TextToSpeechService() {
         if (onIsLanguageAvailable(lang, country, variant) == TextToSpeech.LANG_NOT_SUPPORTED) {
             return ""
         }
+        val iso2 = TtsLocales.toIso2Language(lang)
+        if (iso2 == "pt") {
+            val ptVoice = runBlocking { settings.portugueseVoiceId.first() }
+            if (ptVoice.isNotBlank() && onLoadVoice(ptVoice) == TextToSpeech.SUCCESS) {
+                return ptVoice
+            }
+        }
         // Non-English request → answer from the catalog. The alias set is
         // the user's English-shaped setup (primary alias, per-app
         // mappings); handing a French request an English alias voice is
         // how the engine ends up reading French with an American voice.
-        if (TtsLocales.toIso2Language(lang) != TtsLocales.BASELINE_LANGUAGE) {
+        if (iso2 != TtsLocales.BASELINE_LANGUAGE) {
             TtsLocales.defaultVoiceFor(lang, country, installedVoices())
                 ?.let { return it.id }
         }
@@ -835,17 +842,19 @@ class MarmaladeTtsService : TextToSpeechService() {
                 )
             }
 
-            // Resolve the primary up front — it decides whether the
-            // caller-supplied voiceName is a deliberate pick or an
-            // auto-filled echo of our advertised default.
             val primary: VoiceAlias? = router.resolveAlias(callerPackage)
+            val ptVoice = settings.portugueseVoiceId.first()
+
+            val isPtEcho = requested != null && (
+                requested == "kokoro-direct-v1_0:pf_dora" && ptVoice != "kokoro-direct-v1_0:pf_dora"
+            )
 
             // 2. Caller-specified voice, when deliberate (see kdoc). With
             // no primary set, every requested voice is honored — there is
             // nothing for the auto-fill to mask. Cache-first so the common
             // "request specifies a voice that was seeded at install" path
             // stays off the synth-worker's blocking road.
-            val deliberate = requested != null && (
+            val deliberate = requested != null && !isPtEcho && (
                 primary == null ||
                     (requested != primary.voiceId &&
                         requested != KittenDirectVoiceCatalog.DEFAULT_VOICE_ID)
@@ -886,14 +895,18 @@ class MarmaladeTtsService : TextToSpeechService() {
         if (resolved != null) return applyClientRate(request, resolved)
 
         // 4. Absolute fallback — the engine's default voice with unchanged
-        // speed and no effect. Kitten (not Kokoro): it's baked into the APK,
-        // so it's the one engine guaranteed present even on a fresh offline
-        // install before any primary alias exists. A Kokoro fallback here
-        // would error on a baked-only install (Kokoro is an optional download).
+        // speed and no effect. Kitten for baseline English; user's chosen
+        // Portuguese voice when Portuguese is requested.
+        val reqLang = TtsLocales.toIso2Language(request.language)
+        val defaultVoiceId = if (reqLang == "pt") {
+            runBlocking { settings.portugueseVoiceId.first() }
+        } else {
+            KittenDirectVoiceCatalog.DEFAULT_VOICE_ID
+        }
         return applyClientRate(
             request,
             SynthParams(
-                voiceId = KittenDirectVoiceCatalog.DEFAULT_VOICE_ID,
+                voiceId = defaultVoiceId,
                 speed = 1.0f,
                 effectBlocks = emptyList(),
             ),
@@ -1003,8 +1016,13 @@ class MarmaladeTtsService : TextToSpeechService() {
         val kokoroVoices = installedVoices().filter {
             it.engine == KokoroDirectVoiceCatalog.ENGINE
         }
-        val voice = TtsLocales.defaultVoiceFor(language, null, kokoroVoices)
-            ?: return selfRendered
+        val voice = if (language == "pt") {
+            val ptVoiceId = runBlocking { settings.portugueseVoiceId.first() }
+            kokoroVoices.firstOrNull { it.id == ptVoiceId }
+                ?: TtsLocales.defaultVoiceFor(language, null, kokoroVoices)
+        } else {
+            TtsLocales.defaultVoiceFor(language, null, kokoroVoices)
+        } ?: return selfRendered
         val voiceEspeak =
             UtteranceLanguage.espeakFor(KokoroDirectVoiceCatalog.ENGINE, voice.id, language)
         Log.d(

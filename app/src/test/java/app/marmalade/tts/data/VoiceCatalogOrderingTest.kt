@@ -25,6 +25,7 @@ class VoiceCatalogOrderingTest {
     fun `speakerIdFor resolves raw keys to voices_bin rows`() {
         assertEquals(2, KokoroDirectVoiceCatalog.speakerIdFor("af_bella"))
         assertEquals(41, KokoroDirectVoiceCatalog.speakerIdFor("jm_kumo"))
+        assertEquals(4, KokoroDirectVoiceCatalog.speakerIdFor("pf_jessica"))
         assertEquals(-1, KokoroDirectVoiceCatalog.speakerIdFor("🇺🇸 Bella"))
     }
 

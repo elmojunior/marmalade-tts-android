@@ -155,6 +155,12 @@ internal class FakeSettings(
         primaryAlias.value = value
     }
 
+    private val ptVoiceState = MutableStateFlow("kokoro-direct-v1_0:pf_jessica")
+    override val portugueseVoiceId: Flow<String> = ptVoiceState
+    override suspend fun setPortugueseVoiceId(value: String) {
+        ptVoiceState.value = value
+    }
+
     // Backed by NoOpPreferencesDataStore, the real implementations of these
     // two never emit — and any flow that `combine`s one of them then never
     // emits either, which is a hang rather than a failure. Override with

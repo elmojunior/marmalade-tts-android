@@ -700,6 +700,11 @@ class MarmaladeTtsServiceTest {
             "kokoro-direct-v1_0:ff_siwis",
             service.onGetDefaultVoiceNameFor("fr", "FR", ""),
         )
+        // Portuguese defaults to Jessica (kokoro-direct-v1_0:pf_jessica).
+        assertEquals(
+            "kokoro-direct-v1_0:pf_jessica",
+            service.onGetDefaultVoiceNameFor("por", "BRA", ""),
+        )
         // English is unchanged: the user's primary alias.
         assertEquals(
             "kitten-direct-v0_8:Bella",
@@ -1608,6 +1613,10 @@ internal class FakePreprocessSettings(
     private val primary = MutableStateFlow<String?>(null)
     override val primaryAliasId: Flow<String?> = primary
     override suspend fun setPrimaryAliasId(value: String?) { primary.value = value }
+
+    private val ptVoice = MutableStateFlow("kokoro-direct-v1_0:pf_jessica")
+    override val portugueseVoiceId: Flow<String> = ptVoice
+    override suspend fun setPortugueseVoiceId(value: String) { ptVoice.value = value }
 }
 
 private val NoOpPreferencesDataStoreForService =

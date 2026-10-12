@@ -34,7 +34,7 @@ object KokoroDirectVoiceCatalog {
      * into `voices.bin` row lookup, so this must stay in lockstep with
      * the bundled binary.
      */
-    val voices: List<VoiceMeta> = listOf(
+    private val BASE_VOICES: List<VoiceMeta> = listOf(
         // 0–10  American female
         seed("af_alloy"),
         seed("af_aoede"),
@@ -103,17 +103,28 @@ object KokoroDirectVoiceCatalog {
     ).mapIndexed { i, v -> v.copy(sortOrder = i) }
 
     /**
+     * The exposed Kokoro voices, including cross-lingual mappings such as
+     * Brazilian Portuguese Jessica (pf_jessica).
+     */
+    val voices: List<VoiceMeta> = BASE_VOICES + listOf(
+        seed("pf_jessica").copy(sortOrder = 53),
+    )
+
+    /**
      * Map a raw voice key (the `af_bella` part of the voice id — NOT the
      * flagged displayName) to its speaker index in `voices.bin`.
      * O(1) HashMap lookup — the previous linear `indexOfFirst` paid
      * O(53) per `runInference` call. Returns -1 for unknown keys.
      */
     fun speakerIdFor(voiceKey: String): Int =
-        SPEAKER_INDEX[voiceKey] ?: -1
+        SPEAKER_INDEX[voiceKey] ?: when (voiceKey) {
+            "pf_jessica" -> 4 // af_jessica speaker index in voices.bin
+            else -> -1
+        }
 
     /** Pre-built key→index map; built once at class-load time. */
     private val SPEAKER_INDEX: Map<String, Int> =
-        voices.mapIndexed { i, v -> v.id.substringAfter(':') to i }.toMap()
+        BASE_VOICES.mapIndexed { i, v -> v.id.substringAfter(':') to i }.toMap()
 
     /**
      * UI label for a raw voice key: flag + capitalized speaker handle,

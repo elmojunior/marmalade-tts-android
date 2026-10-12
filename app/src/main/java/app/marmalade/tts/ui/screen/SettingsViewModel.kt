@@ -178,6 +178,22 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    /**
+     * The voice used by default for Portuguese (Brazil) system TTS.
+     */
+    val portugueseVoiceId: StateFlow<String> = settings.portugueseVoiceId
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
+            initialValue = "kokoro-direct-v1_0:pf_jessica",
+        )
+
+    fun setPortugueseVoiceId(id: String) {
+        viewModelScope.launch {
+            settings.setPortugueseVoiceId(id)
+        }
+    }
+
     private companion object {
         // Standard 5s grace period after the last observer detaches.
         // Matches the value used in SpeakViewModel / VoicePickerViewModel

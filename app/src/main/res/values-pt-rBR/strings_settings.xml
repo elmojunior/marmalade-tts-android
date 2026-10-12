@@ -14,6 +14,8 @@
     <string name="settings_system_integration">Integração com o sistema</string>
     <string name="settings_set_system_engine">Definir como motor de TTS do sistema</string>
     <string name="settings_set_system_engine_desc">Abre as configurações de conversão de texto em fala do Android para você escolher o Marmalade como motor padrão. Necessário para que apps externos usem a nossa síntese de voz.</string>
+    <string name="settings_portuguese_voice_title">Voz em Português (Brasil)</string>
+    <string name="settings_portuguese_voice_desc">Voz usada quando o sistema TTS ou aplicativos solicitarem reprodução em português. A Jéssica pronuncia português com alta naturalidade via Kokoro.</string>
 
     <string name="settings_keepalive">Manter o motor carregado</string>
     <string name="settings_keepalive_off">Desativado</string>

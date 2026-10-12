@@ -89,6 +89,20 @@ open class SettingsRepository @Inject constructor(
     }
 
     /**
+     * Default voice used when Android system TTS requests Portuguese (Brazil).
+     * Defaults to Kokoro Jessica ("kokoro-direct-v1_0:pf_jessica").
+     */
+    open val portugueseVoiceId: Flow<String> = dataStore.data.map { prefs ->
+        prefs[KEY_PORTUGUESE_VOICE_ID] ?: "kokoro-direct-v1_0:pf_jessica"
+    }
+
+    open suspend fun setPortugueseVoiceId(id: String) {
+        dataStore.edit { prefs ->
+            prefs[KEY_PORTUGUESE_VOICE_ID] = id
+        }
+    }
+
+    /**
      * True once the user has completed (or dismissed) the onboarding flow.
      *
      * Defaults to `false` for fresh installs — `AppRoot` reads this to
@@ -713,6 +727,9 @@ open class SettingsRepository @Inject constructor(
         // G3 well but spills onto efficiency cores on Snapdragon Gen 2/3
         // and Exynos 2400, regressing 5-20% per ORT bench.
         private val KEY_INTRA_OP_THREADS = intPreferencesKey("intra_op_threads")
+
+        // Portuguese default voice for Android system TTS.
+        private val KEY_PORTUGUESE_VOICE_ID = stringPreferencesKey("portuguese_voice_id")
 
         // Show the legacy sherpa engines in the engine lists. Absent ⇒
         // BuildConfig.DEBUG (shown in debug, hidden in release). v0.3.0-alpha.10.Z.

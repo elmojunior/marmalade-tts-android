@@ -121,6 +121,7 @@ fun SettingsScreen(
     val themePreset by viewModel.themePreset.collectAsStateWithLifecycle()
     val themeMode by viewModel.themeMode.collectAsStateWithLifecycle()
     val keepaliveMode by viewModel.keepaliveMode.collectAsStateWithLifecycle()
+    val portugueseVoiceId by viewModel.portugueseVoiceId.collectAsStateWithLifecycle()
 
     Scaffold(
         // Nested-Scaffold inset handoff — see SpeakScreen for the full note.
@@ -153,7 +154,10 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
-            SystemDefaultSection()
+            SystemDefaultSection(
+                portugueseVoiceId = portugueseVoiceId,
+                onPortugueseVoiceSelected = viewModel::setPortugueseVoiceId,
+            )
 
             HorizontalDivider()
 
@@ -242,8 +246,12 @@ private fun AppearanceSection(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SystemDefaultSection() {
+private fun SystemDefaultSection(
+    portugueseVoiceId: String,
+    onPortugueseVoiceSelected: (String) -> Unit,
+) {
     SectionHeader(stringResource(R.string.settings_system_integration))
     val context = androidx.compose.ui.platform.LocalContext.current
     ListItem(
@@ -262,6 +270,37 @@ private fun SystemDefaultSection() {
         },
         colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surface),
     )
+
+    Text(
+        text = stringResource(R.string.settings_portuguese_voice_title),
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp),
+    )
+    Text(
+        text = stringResource(R.string.settings_portuguese_voice_desc),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 4.dp),
+    )
+    FlowRow(
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        val ptVoices = listOf(
+            "kokoro-direct-v1_0:pf_jessica" to "🇧🇷 Jéssica",
+            "kokoro-direct-v1_0:pf_dora" to "🇧🇷 Dora",
+            "kokoro-direct-v1_0:pm_alex" to "🇧🇷 Alex",
+            "kokoro-direct-v1_0:pm_santa" to "🇧🇷 Santa",
+        )
+        ptVoices.forEach { (id, label) ->
+            MarmaladeFilterChip(
+                selected = id == portugueseVoiceId,
+                onClick = { onPortugueseVoiceSelected(id) },
+                label = { Text(label) },
+            )
+        }
+    }
 }
 
 /**

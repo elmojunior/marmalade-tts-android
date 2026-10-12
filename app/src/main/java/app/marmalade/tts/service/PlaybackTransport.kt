@@ -40,6 +40,22 @@ class PlaybackTransport @Inject constructor() {
     /** What the reader is doing, for the notification to reflect. */
     val reader: StateFlow<ReaderTransportState> = _reader.asStateFlow()
 
+    private val _progress = MutableStateFlow(0f)
+    /** Playback progress from 0.0f to 1.0f. */
+    val progress: StateFlow<Float> = _progress.asStateFlow()
+
+    private val _currentPositionMs = MutableStateFlow(0L)
+    /** Elapsed playback time in milliseconds. */
+    val currentPositionMs: StateFlow<Long> = _currentPositionMs.asStateFlow()
+
+    private val _durationMs = MutableStateFlow(0L)
+    /** Total audio duration in milliseconds. */
+    val durationMs: StateFlow<Long> = _durationMs.asStateFlow()
+
+    private val _active = MutableStateFlow(false)
+    /** True while a speech playback is active. */
+    val active: StateFlow<Boolean> = _active.asStateFlow()
+
     /** Service side: mirror the service's `paused` flag. */
     fun setPaused(paused: Boolean) {
         _paused.value = paused
@@ -48,6 +64,24 @@ class PlaybackTransport @Inject constructor() {
     /** Reader side: publish the article and what its transport can do. */
     fun setReader(state: ReaderTransportState) {
         _reader.value = state
+    }
+
+    /** Service side: update playback progress and duration. */
+    fun setProgress(posMs: Long, durMs: Long) {
+        _currentPositionMs.value = posMs
+        _durationMs.value = durMs
+        _progress.value = if (durMs > 0) (posMs.toFloat() / durMs.toFloat()).coerceIn(0f, 1f) else 0f
+    }
+
+    /** Service side: set whether speech playback is currently active. */
+    fun setActive(active: Boolean) {
+        _active.value = active
+        if (!active) {
+            _progress.value = 0f
+            _currentPositionMs.value = 0L
+            _durationMs.value = 0L
+            _paused.value = false
+        }
     }
 }
 

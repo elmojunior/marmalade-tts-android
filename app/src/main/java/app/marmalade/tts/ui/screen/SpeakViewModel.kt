@@ -1,5 +1,7 @@
 package app.marmalade.tts.ui.screen
 
+import android.content.Context
+import android.content.Intent
 import android.util.Log
 import androidx.annotation.StringRes
 import androidx.lifecycle.ViewModel
@@ -16,7 +18,10 @@ import app.marmalade.tts.data.db.VoiceAliasDao
 import app.marmalade.tts.data.db.VoiceMeta
 import app.marmalade.tts.data.db.VoiceMetaDao
 import app.marmalade.tts.install.EngineCatalog
+import app.marmalade.tts.service.MarmaladeSynthService
+import app.marmalade.tts.service.PlaybackTransport
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -119,12 +124,14 @@ sealed class PlaybackState {
  */
 @HiltViewModel
 class SpeakViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val synthesizer: SpeechPlayer,
     private val settings: SettingsRepository,
     private val voiceDao: VoiceMetaDao,
     private val aliasDao: VoiceAliasDao,
     private val effectResolver: EffectResolver,
     private val voicePaths: VoicePathResolver,
+    private val transport: PlaybackTransport,
 ) : ViewModel() {
 
     private val _text = MutableStateFlow("")
@@ -132,6 +139,12 @@ class SpeakViewModel @Inject constructor(
 
     private val _playbackState = MutableStateFlow<PlaybackState>(PlaybackState.Idle)
     val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
+
+    val isPaused: StateFlow<Boolean> = transport.paused
+    val progress: StateFlow<Float> = transport.progress
+    val currentPositionMs: StateFlow<Long> = transport.currentPositionMs
+    val durationMs: StateFlow<Long> = transport.durationMs
+    val isTransportActive: StateFlow<Boolean> = transport.active
 
     /**
      * The voice ID we most recently applied via [applyAlias]. When the
@@ -601,6 +614,44 @@ class SpeakViewModel @Inject constructor(
         speakGeneration++
         synthesizer.cancel()
         _playbackState.value = PlaybackState.Idle
+    }
+
+    /** Pause current playback via service. */
+    fun pause() {
+        context.startService(
+            Intent(context, MarmaladeSynthService::class.java)
+                .setAction(MarmaladeSynthService.ACTION_PAUSE),
+        )
+    }
+
+    /** Resume paused playback via service. */
+    fun resume() {
+        context.startService(
+            Intent(context, MarmaladeSynthService::class.java)
+                .setAction(MarmaladeSynthService.ACTION_RESUME),
+        )
+    }
+
+    /** Restart playback from the beginning. */
+    fun restart() {
+        if (_text.value.isNotBlank()) {
+            cancel()
+            speak()
+        } else {
+            context.startService(
+                Intent(context, MarmaladeSynthService::class.java)
+                    .setAction(MarmaladeSynthService.ACTION_RESTART),
+            )
+        }
+    }
+
+    /** Stop any in-flight playback and silence service. */
+    fun stop() {
+        cancel()
+        context.startService(
+            Intent(context, MarmaladeSynthService::class.java)
+                .setAction(MarmaladeSynthService.ACTION_STOP),
+        )
     }
 
     override fun onCleared() {

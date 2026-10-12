@@ -19,8 +19,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
@@ -30,14 +28,17 @@ import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import java.util.Locale
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -155,6 +156,11 @@ fun SpeakScreen(
     val currentVoice by viewModel.currentVoice.collectAsStateWithLifecycle()
     val personas by viewModel.personas.collectAsStateWithLifecycle()
     val currentPersona by viewModel.currentPersona.collectAsStateWithLifecycle()
+    val isPaused by viewModel.isPaused.collectAsStateWithLifecycle()
+    val progress by viewModel.progress.collectAsStateWithLifecycle()
+    val currentPositionMs by viewModel.currentPositionMs.collectAsStateWithLifecycle()
+    val durationMs by viewModel.durationMs.collectAsStateWithLifecycle()
+    val isTransportActive by viewModel.isTransportActive.collectAsStateWithLifecycle()
     var sheetOpen by rememberSaveable { mutableStateOf(false) }
 
     // Re-entering the screen (e.g. back from Settings → Engines after an
@@ -166,8 +172,12 @@ fun SpeakScreen(
     // work the user asked for is in flight, and Stop must stay reachable so
     // a slow load can be abandoned. Only the status line tells them apart.
     val isSpeaking = playbackState is PlaybackState.Speaking ||
-        playbackState is PlaybackState.Loading
+        playbackState is PlaybackState.Loading ||
+        isTransportActive
     val isModelMissing = playbackState is PlaybackState.ModelMissing
+    val canRestart = isSpeaking || isPaused
+    val canStop = isSpeaking || isPaused
+    val canPlayOrPause = if (isPaused || isSpeaking) true else (text.isNotBlank() && !isModelMissing)
 
     Scaffold(
         // Nested-Scaffold inset handoff: AppRoot's outer Scaffold already
@@ -206,26 +216,22 @@ fun SpeakScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                // Landscape (and large font scales) leave less height than the
-                // column needs; without this the Speak button and status line
-                // sit below the fold with no way to reach them.
-                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Spacer(Modifier.height(8.dp))
 
             // Small animated mascot — drawable switches with playback state.
-            val mascotRes = if (isSpeaking) R.drawable.mascot_speaking else R.drawable.mascot_happy
+            val mascotRes = if (isSpeaking && !isPaused) R.drawable.mascot_speaking else R.drawable.mascot_happy
             Image(
                 painter = painterResource(id = mascotRes),
                 // Decorative: the status line below says whether we're
                 // speaking, so the mascot is a redundant first swipe stop.
                 contentDescription = null,
-                modifier = Modifier.size(64.dp),
+                modifier = Modifier.size(56.dp),
             )
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(8.dp))
 
             // The semantics description names the field's purpose for
             // TalkBack — the visible floating label alone read bare
@@ -238,13 +244,11 @@ fun SpeakScreen(
                 label = { Text(stringResource(R.string.speak_text_field_label)) },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 160.dp)
+                    .weight(1f)
                     .semantics { contentDescription = speakFieldCd },
-                minLines = 5,
-                maxLines = 8,
             )
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(12.dp))
 
             // One row naming what will be heard; tap opens the sheet. This
             // replaced a voice chip plus a wrapping row of alias chips —
@@ -255,31 +259,139 @@ fun SpeakScreen(
                 onClick = { sheetOpen = true },
             )
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(10.dp))
 
-            // While speaking, the same button becomes a Stop affordance so
-            // the user can interrupt long synth + playback (Pocket Bible
-            // chapter, slow chunk). When idle, requires non-blank text and
-            // a present engine; while speaking it stays enabled regardless
-            // so cancel is always reachable.
-            val canSpeak = isSpeaking || (text.isNotBlank() && !isModelMissing)
-            Button(
-                onClick = { if (isSpeaking) viewModel.cancel() else viewModel.speak() },
-                enabled = canSpeak,
+            // Playback progress bar directly above the buttons
+            Column(
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(
-                    stringResource(
-                        if (isSpeaking) R.string.speak_button_stop else R.string.speak_button_speak,
-                    ),
-                )
+                if (isSpeaking && !isPaused && durationMs == 0L) {
+                    LinearProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        progress = { if (durationMs > 0L) progress else 0f },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = formatDuration(currentPositionMs),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = formatDuration(durationMs),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(8.dp))
+
+            // 3 Transport buttons: Recomeçar, Play/Pause, Parar
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = { viewModel.restart() },
+                    enabled = canRestart,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_media_restart),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = stringResource(R.string.speak_button_restart),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                Button(
+                    onClick = {
+                        when {
+                            isPaused -> viewModel.resume()
+                            isSpeaking -> viewModel.pause()
+                            else -> viewModel.speak()
+                        }
+                    },
+                    enabled = canPlayOrPause,
+                    modifier = Modifier.weight(1.1f),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp),
+                ) {
+                    val iconRes = if (isSpeaking && !isPaused) {
+                        R.drawable.ic_media_pause
+                    } else {
+                        R.drawable.ic_media_play
+                    }
+                    val labelRes = when {
+                        isPaused -> R.string.speak_button_resume
+                        isSpeaking -> R.string.speak_button_pause
+                        else -> R.string.speak_button_speak
+                    }
+                    Icon(
+                        painter = painterResource(iconRes),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = stringResource(labelRes),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = { viewModel.stop() },
+                    enabled = canStop,
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 10.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_media_stop),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = stringResource(R.string.speak_button_stop),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
 
             // Status line — single source of truth for "what's going on."
             val installCta = installCtaFor(currentVoice)
-            Box(modifier = Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 20.dp),
+            ) {
                 if (isModelMissing) {
                     // Make the missing-engine state actionable: a text button
                     // that routes the user straight to the Engines screen.
@@ -317,6 +429,7 @@ fun SpeakScreen(
                     }
                 }
             }
+            Spacer(Modifier.height(8.dp))
         }
     }
 
@@ -546,3 +659,11 @@ private fun installCtaFor(voice: VoiceMeta?): String {
         stringResource(R.string.speak_install_cta_generic)
     }
 }
+
+private fun formatDuration(ms: Long): String {
+    val totalSeconds = (ms / 1000).coerceAtLeast(0)
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+}
+

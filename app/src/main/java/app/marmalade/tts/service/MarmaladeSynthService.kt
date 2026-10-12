@@ -13,10 +13,13 @@ import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
+import androidx.core.content.ContextCompat
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
@@ -536,6 +539,7 @@ class MarmaladeSynthService : Service() {
     private fun startNextLocked() {
         val next = queue.pollFirst() ?: run {
             // Nothing left to do — release focus + foreground.
+            transport.setActive(false)
             stopProgressUpdates()
             stopIfIdle()
             return
@@ -552,6 +556,8 @@ class MarmaladeSynthService : Service() {
         currentRequest = next
         currentDurationMs = estimateDurationMs(next.text, next.speed)
         lastStateText = getString(R.string.service_synth_state_preparing)
+        transport.setActive(true)
+        transport.setProgress(0L, currentDurationMs)
         updateMediaMetadata(
             getString(R.string.service_synth_notification_title_playing),
             lastStateText,
@@ -580,6 +586,7 @@ class MarmaladeSynthService : Service() {
                     if (queue.isNotEmpty()) {
                         startNextLocked()
                     } else {
+                        transport.setActive(false)
                         stopProgressUpdates()
                         stopIfIdle()
                     }
@@ -1031,6 +1038,7 @@ class MarmaladeSynthService : Service() {
                 getString(R.string.service_synth_notification_title_playing)
             }
             updateMediaMetadata(title, lastStateText, exactDurationMs)
+            transport.setProgress(currentPositionMs(), exactDurationMs)
         }
         engineRtfSample(warm, skewed, renderNanos, audioSamples, sampleRate)
             ?.let { recordEngineRtf(engineName, it) }
@@ -1080,6 +1088,7 @@ class MarmaladeSynthService : Service() {
                         getString(R.string.service_synth_notification_title_playing)
                     }
                     updateMediaMetadata(title, lastStateText, exactDurationMs)
+                    transport.setProgress(currentPositionMs(), exactDurationMs)
                 }
                 channel.send(SynthAudio(result.pcm, result.sampleRate))
             }
@@ -1160,6 +1169,7 @@ class MarmaladeSynthService : Service() {
         // outlive the stopIfIdle that follows, as it was never foreground.
         if (!hasWork()) return
         val pos = currentPositionMs()
+        transport.setProgress(pos, currentDurationMs)
         updateMediaState(PlaybackStateCompat.STATE_PAUSED, pos)
         updateNotification(getString(R.string.service_synth_state_paused))
     }
@@ -1175,6 +1185,7 @@ class MarmaladeSynthService : Service() {
         if (!hasWork()) return
         holdWakeLock()
         val pos = currentPositionMs()
+        transport.setProgress(pos, currentDurationMs)
         updateMediaState(PlaybackStateCompat.STATE_PLAYING, pos)
         updateNotification(getString(R.string.service_synth_state_speaking))
         startProgressUpdates()
@@ -1233,6 +1244,7 @@ class MarmaladeSynthService : Service() {
     private fun doStop() {
         stopProgressUpdates()
         currentDurationMs = 0L
+        transport.setActive(false)
         synchronized(lock) {
             cancelAllLocked()
             releaseWakeLock()
@@ -1550,7 +1562,10 @@ class MarmaladeSynthService : Service() {
             while (isActive) {
                 delay(1000L)
                 if (paused || cancelled) continue
-                if (currentTrack != null && currentDurationMs > 0) {
+                val pos = currentPositionMs()
+                val dur = currentDurationMs
+                transport.setProgress(pos, dur)
+                if (currentTrack != null && dur > 0) {
                     val n = buildNotification(lastStateText)
                     notificationManager?.notify(NOTIFICATION_ID, n)
                 }
@@ -1561,6 +1576,25 @@ class MarmaladeSynthService : Service() {
     private fun stopProgressUpdates() {
         progressJob?.cancel()
         progressJob = null
+    }
+
+    private fun getMarmaladeArtBitmap(): Bitmap? {
+        return try {
+            val size = 256
+            val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            canvas.drawColor(0xFFF97316.toInt()) // Marmalade orange
+            val drawable = ContextCompat.getDrawable(this, R.drawable.ic_stat_marmalade_speaking)
+            drawable?.let {
+                val padding = 48
+                it.setBounds(padding, padding, size - padding, size - padding)
+                it.setTint(android.graphics.Color.WHITE)
+                it.draw(canvas)
+            }
+            bitmap
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun ensureMediaSession() {
@@ -1661,6 +1695,11 @@ class MarmaladeSynthService : Service() {
         if (durationMs > 0) {
             metadata.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs)
         }
+        val art = getMarmaladeArtBitmap()
+        if (art != null) {
+            metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art)
+            metadata.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, art)
+        }
         session.setMetadata(metadata.build())
     }
 
@@ -1730,12 +1769,12 @@ class MarmaladeSynthService : Service() {
             servicePendingIntent(ACTION_RESTART),
         )
         val pauseAction = NotificationCompat.Action(
-            android.R.drawable.ic_media_pause,
+            R.drawable.ic_media_pause,
             getString(R.string.service_synth_action_pause),
             servicePendingIntent(ACTION_PAUSE),
         )
         val resumeAction = NotificationCompat.Action(
-            android.R.drawable.ic_media_play,
+            R.drawable.ic_media_play,
             getString(R.string.service_synth_action_resume),
             servicePendingIntent(ACTION_RESUME),
         )
@@ -1775,13 +1814,18 @@ class MarmaladeSynthService : Service() {
             getString(R.string.service_synth_notification_title_playing)
         }
 
+        val marmaladeColor = 0xFFF97316.toInt()
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(stateText)
             .setSmallIcon(R.drawable.ic_stat_marmalade_speaking)
+            .setColor(marmaladeColor)
+            .setColorized(true)
             .setOnlyAlertOnce(true)
             .setOngoing(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+
+        getMarmaladeArtBitmap()?.let { builder.setLargeIcon(it) }
 
         val duration = currentDurationMs
         if (duration > 0) {
